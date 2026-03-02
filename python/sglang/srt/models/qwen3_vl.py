@@ -1037,6 +1037,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             prefix=add_prefix("model.visual", prefix),
             use_data_parallel=self.use_data_parallel,
         )
+        self._vit_cpu_offload = get_global_server_args().kt_vit_cpu_offload
+        self._vit_gpu_device = None
 
         # TODO: make it more elegant
         if language_model_cls is Qwen3LLMModel:
@@ -1095,7 +1097,35 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
+    def _maybe_offload_vit(self):
+        """Offload ViT to CPU after weights are loaded. Called at the end of load_weights."""
+        if self._vit_cpu_offload and hasattr(self, "visual"):
+            self._vit_gpu_device = next(self.visual.parameters()).device
+            self.visual.to("cpu")
+            logger.info("ViT offloaded to CPU to save ~0.9 GB VRAM")
+
+    def _vit_to_gpu(self):
+        if self._vit_cpu_offload and next(self.visual.parameters()).device.type == "cpu":
+            if self._vit_gpu_device is None:
+                self._vit_gpu_device = next(self.model.parameters()).device
+            logger.info("ViT: moving to GPU (%s)", self._vit_gpu_device)
+            self.visual.to(self._vit_gpu_device)
+
+    def _vit_to_cpu(self):
+        if self._vit_cpu_offload:
+            self.visual.to("cpu")
+            logger.info("ViT: moved back to CPU")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        self._vit_to_gpu()
+        try:
+            return self._get_image_feature_impl(items)
+        finally:
+            self._vit_to_cpu()
+
+    def _get_image_feature_impl(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
@@ -1200,6 +1230,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return torch.cat(all_chunk_embeds, dim=0)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        self._vit_to_gpu()
+        try:
+            return self._get_video_feature_impl(items)
+        finally:
+            self._vit_to_cpu()
+
+    def _get_video_feature_impl(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         for item in items:
             item.feature = item.feature.to(self.visual.device)
         # in qwen-vl, last dim is the same
@@ -1373,6 +1410,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+        self._maybe_offload_vit()
 
 
 EntryClass = Qwen3VLForConditionalGeneration

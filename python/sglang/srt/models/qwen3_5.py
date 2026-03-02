@@ -1344,6 +1344,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
 
+        self._maybe_offload_vit()
         return loaded_params
 
     @classmethod

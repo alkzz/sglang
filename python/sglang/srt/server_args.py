@@ -563,6 +563,7 @@ class ServerArgs:
     kt_expert_placement_strategy: str = "uniform"
     kt_gpu_fallback_release: bool = False
     kt_gpu_fallback_per_layer_release: bool = False
+    kt_vit_cpu_offload: bool = False
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
@@ -4517,6 +4518,13 @@ class ServerArgs:
             help="[ktransformers parameter] Release GPU expert weight buffer after each layer's MoE compute during GPU fallback, "
                  "not just after the last layer. Frees ~6 GB between MoE operations so attention kernels have VRAM headroom. "
                  "Implies --kt-gpu-fallback-release. Enables larger --chunked-prefill-size values.",
+        )
+        parser.add_argument(
+            "--kt-vit-cpu-offload",
+            action="store_true",
+            default=ServerArgs.kt_vit_cpu_offload,
+            help="[ktransformers parameter] Offload ViT (vision encoder) weights to CPU when not processing images/video. "
+                 "Frees ~0.9 GB VRAM for other operations. ViT is moved to GPU on demand with ~40-80 ms overhead per VL request.",
         )
 
         # Diffusion LLM
