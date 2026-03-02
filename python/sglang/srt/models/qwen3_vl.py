@@ -1039,6 +1039,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         )
         self._vit_cpu_offload = get_global_server_args().kt_vit_cpu_offload
         self._vit_gpu_device = None
+        self._offload_embed_lm_head = get_global_server_args().kt_offload_embed_lm_head
+        self._lm_head_gpu_device = None
+        self._cuda_graph_needs_recapture = False
 
         # TODO: make it more elegant
         if language_model_cls is Qwen3LLMModel:
@@ -1117,6 +1120,29 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             logger.info("ViT: moved back to CPU")
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    def _maybe_offload_embed_lm_head(self):
+        """Record GPU device for embed_tokens and lm_head (offloaded on demand during prefill)."""
+        if self._offload_embed_lm_head:
+            if hasattr(self, "lm_head") and self.lm_head is not None:
+                self._lm_head_gpu_device = self.lm_head.weight.device
+            logger.info("embed_tokens/lm_head prefill-offload enabled (~3.9 GB freed during prefill)")
+
+    def _embed_lm_head_to_cpu(self):
+        if not self._offload_embed_lm_head:
+            return
+        self.lm_head.to("cpu")
+        self.model.embed_tokens.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _embed_lm_head_to_gpu(self):
+        if not self._offload_embed_lm_head:
+            return
+        if self.lm_head.weight.device.type == "cpu":
+            self.lm_head.to(self._lm_head_gpu_device)
+            self.model.embed_tokens.to(self._lm_head_gpu_device)
+            self._cuda_graph_needs_recapture = True
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         self._vit_to_gpu()
@@ -1304,6 +1330,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
+        if forward_batch.forward_mode.is_extend():
+            threshold = get_global_server_args().kt_gpu_prefill_token_threshold
+            if threshold and input_ids.shape[0] >= threshold:
+                self._embed_lm_head_to_cpu()
+
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -1316,6 +1347,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
+                self._embed_lm_head_to_gpu()
                 return self.logits_processor(
                     input_ids,
                     hidden_states,
@@ -1412,6 +1444,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight)
 
         self._maybe_offload_vit()
+        self._maybe_offload_embed_lm_head()
 
 
 EntryClass = Qwen3VLForConditionalGeneration

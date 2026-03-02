@@ -1010,7 +1010,10 @@ def embed_mm_inputs(
     # filled with the hash values of the multimodal for the prefix matching in the radix attention.
     # There values are useless because their embeddings will be replaced by vision embeddings anyway.
     input_ids.clamp_(min=0, max=vocab_size - 1)
-    input_embeds = input_embedding(input_ids)
+    if input_embedding.weight.device.type == "cpu":
+        input_embeds = input_embedding(input_ids.cpu()).to(input_ids.device)
+    else:
+        input_embeds = input_embedding(input_ids)
 
     # deepstack embedding
     if use_deepstack:
@@ -1123,7 +1126,10 @@ def general_mm_embed_routine(
             forward_batch.mm_inputs = None
             forward_batch.mm_input_embeds = input_embeds
         else:
-            input_embeds = embed_tokens(input_ids)
+            if embed_tokens.weight.device.type == "cpu":
+                input_embeds = embed_tokens(input_ids.cpu()).to(input_ids.device)
+            else:
+                input_embeds = embed_tokens(input_ids)
         # Copy to pre-allocated buffer if available (for CUDA graph address stability)
         if forward_batch.input_embeds is not None:
             forward_batch.input_embeds.copy_(input_embeds)

@@ -939,6 +939,12 @@ class CudaGraphRunner:
         return graph, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
+        model = self.model_runner.model
+        if getattr(model, "_cuda_graph_needs_recapture", False):
+            model._cuda_graph_needs_recapture = False
+            logger.info("Re-capturing CUDA graph after embed/lm_head reload")
+            self.capture()
+            return
 
         # If the required capture_hidden_mode changes, we need to recapture the graph
 

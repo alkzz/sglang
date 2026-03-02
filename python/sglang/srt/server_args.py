@@ -564,6 +564,7 @@ class ServerArgs:
     kt_gpu_fallback_release: bool = False
     kt_gpu_fallback_per_layer_release: bool = False
     kt_vit_cpu_offload: bool = False
+    kt_offload_embed_lm_head: bool = False
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
@@ -4525,6 +4526,15 @@ class ServerArgs:
             default=ServerArgs.kt_vit_cpu_offload,
             help="[ktransformers parameter] Offload ViT (vision encoder) weights to CPU when not processing images/video. "
                  "Frees ~0.9 GB VRAM for other operations. ViT is moved to GPU on demand with ~40-80 ms overhead per VL request.",
+        )
+        parser.add_argument(
+            "--kt-offload-embed-lm-head",
+            action="store_true",
+            default=ServerArgs.kt_offload_embed_lm_head,
+            help="[ktransformers parameter] Offload embed_tokens and lm_head weights to CPU. "
+                 "embed_tokens (~1.9 GB) stays on CPU permanently (lookups done on CPU). "
+                 "lm_head (~1.9 GB) moves to GPU on demand for logit computation. "
+                 "Frees ~3.9 GB VRAM with negligible overhead.",
         )
 
         # Diffusion LLM

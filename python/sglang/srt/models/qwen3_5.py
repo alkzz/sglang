@@ -721,7 +721,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         # Initialize hidden states
         if self.pp_group.is_first_rank:
             if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
+                if self.embed_tokens.weight.device.type == "cpu":
+                    hidden_states = self.embed_tokens(input_ids.cpu()).to(input_ids.device)
+                else:
+                    hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
             residual = None
@@ -1345,6 +1348,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             loaded_params.add(name)
 
         self._maybe_offload_vit()
+        self._maybe_offload_embed_lm_head()
         return loaded_params
 
     @classmethod
