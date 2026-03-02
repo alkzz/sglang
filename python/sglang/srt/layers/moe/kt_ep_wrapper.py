@@ -82,6 +82,8 @@ class KTConfig:
     num_layers: Optional[int] = None
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
+    kt_gpu_fallback_release: bool = False
+    kt_gpu_fallback_per_layer_release: bool = False
 
 
 _SHARED_FULL_CONTEXT = None
@@ -163,6 +165,9 @@ class SharedFullContext:
 
         # Create CPU buffers once for weight loading (shared across layers)
         self._create_cpu_buffers()
+
+        self._weights_released = False
+        self._param_meta = {}
 
     def _build_layers(self, layer, init_args, global_num_experts, moe_runner_config):
         from sglang.srt.layers.moe.fused_moe_triton.layer import (
@@ -499,6 +504,64 @@ class SharedFullContext:
                 all_rank_ptrs[name].append(ptr)
 
         return all_rank_ptrs
+
+    def release_gpu_weights(self, flush_cache: bool = True):
+        """Release GPU expert weight tensors to free VRAM.
+
+        Keeps the SharedFullContext object, CPU buffers, and metadata alive so
+        that re-allocation on the next GPU fallback only needs cheap
+        torch.empty() calls instead of full re-initialization.
+
+        Args:
+            flush_cache: If True, call torch.cuda.empty_cache() to return
+                freed blocks to the CUDA driver (needed for non-PyTorch
+                consumers like the ViT). If False, freed blocks stay in
+                PyTorch's caching allocator for fast reuse by subsequent
+                PyTorch ops (e.g., attention kernels).
+        """
+        if self._weights_released:
+            return
+
+        for name, param in self.original_params.items():
+            self._param_meta[f"param_{name}"] = (
+                param.data.shape,
+                param.data.dtype,
+                param.data.device,
+            )
+            param.data = torch.empty(0, device=param.data.device, dtype=param.data.dtype)
+
+        for name, buf in self.original_buffers.items():
+            if buf is not None and buf.numel() > 0:
+                self._param_meta[f"buf_{name}"] = (
+                    buf.data.shape,
+                    buf.data.dtype,
+                    buf.data.device,
+                )
+                buf.data = torch.empty(0, device=buf.data.device, dtype=buf.data.dtype)
+
+        self._weights_released = True
+        if flush_cache and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logger.info("KT fallback: released GPU expert weight buffer")
+
+    def _ensure_gpu_weights_allocated(self):
+        """Re-allocate GPU weight tensors if previously released."""
+        if not self._weights_released:
+            return
+
+        for name, param in self.original_params.items():
+            key = f"param_{name}"
+            shape, dtype, device = self._param_meta[key]
+            param.data = torch.empty(shape, dtype=dtype, device=device)
+
+        for name, buf in self.original_buffers.items():
+            key = f"buf_{name}"
+            if key in self._param_meta:
+                shape, dtype, device = self._param_meta[key]
+                buf.data = torch.empty(shape, dtype=dtype, device=device)
+
+        self._weights_released = False
+        logger.debug("KT fallback: re-allocated GPU expert weight buffer")
 
     def _prepare_weight_int4(self, wrapper):
         """Prepare INT4 Marlin weights by writing from KT, copying to GPU, and postprocessing.
@@ -1187,6 +1250,8 @@ class SharedFullContext:
             gpu_experts_mask: bool tensor [num_experts], True = on GPU (optional)
             logical_to_gpu_index: int tensor [num_experts], maps logical ID to GPU index (optional)
         """
+        self._ensure_gpu_weights_allocated()
+
         for name, param in self.original_params.items():
             setattr(self.gpu_layer, name, param)
         for name, buf in self.original_buffers.items():
@@ -1624,6 +1689,8 @@ def create_kt_config_from_server_args(
         num_layers=num_layers,
         gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=server_args.kt_enable_dynamic_expert_update,
+        kt_gpu_fallback_release=server_args.kt_gpu_fallback_release,
+        kt_gpu_fallback_per_layer_release=server_args.kt_gpu_fallback_per_layer_release,
     )
 
 
@@ -2300,6 +2367,20 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         self.kt_config.layer_idx,
                         compute_time,
                     )
+
+            if self.kt_config.kt_gpu_fallback_per_layer_release:
+                is_last_layer = (
+                    self.kt_config.num_layers is not None
+                    and self.kt_config.layer_idx == self.kt_config.num_layers - 1
+                )
+                ctx.release_gpu_weights(flush_cache=is_last_layer)
+            elif self.kt_config.kt_gpu_fallback_release:
+                is_last_layer = (
+                    self.kt_config.num_layers is not None
+                    and self.kt_config.layer_idx == self.kt_config.num_layers - 1
+                )
+                if is_last_layer:
+                    ctx.release_gpu_weights(flush_cache=True)
 
             return result
 
