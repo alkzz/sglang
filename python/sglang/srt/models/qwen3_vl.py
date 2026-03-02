@@ -1100,49 +1100,95 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
+    @staticmethod
+    def _make_pinned_copies(module):
+        """Create pinned CPU copies of all parameters for fast DMA transfers."""
+        copies = {}
+        for name, param in module.named_parameters():
+            pinned = torch.empty_like(param.data, device="cpu", pin_memory=True)
+            pinned.copy_(param.data)
+            copies[name] = pinned
+        return copies
+
     def _maybe_offload_vit(self):
-        """Offload ViT to CPU after weights are loaded. Called at the end of load_weights."""
+        """Offload ViT to CPU (pinned) after weights are loaded."""
         if self._vit_cpu_offload and hasattr(self, "visual"):
             self._vit_gpu_device = next(self.visual.parameters()).device
-            self.visual.to("cpu")
-            logger.info("ViT offloaded to CPU to save ~0.9 GB VRAM")
+            self._vit_pinned = self._make_pinned_copies(self.visual)
+            for name, param in self.visual.named_parameters():
+                param.data = self._vit_pinned[name]
+            torch.cuda.empty_cache()
+            logger.info("ViT offloaded to CPU (pinned) to save ~0.9 GB VRAM")
 
     def _vit_to_gpu(self):
-        if self._vit_cpu_offload and next(self.visual.parameters()).device.type == "cpu":
+        if not self._vit_cpu_offload:
+            return
+        if next(self.visual.parameters()).device.type == "cpu":
             if self._vit_gpu_device is None:
                 self._vit_gpu_device = next(self.model.parameters()).device
-            logger.info("ViT: moving to GPU (%s)", self._vit_gpu_device)
-            self.visual.to(self._vit_gpu_device)
+            import time
+            t0 = time.perf_counter()
+            for name, param in self.visual.named_parameters():
+                gpu_tensor = torch.empty_like(param.data, device=self._vit_gpu_device)
+                gpu_tensor.copy_(param.data)
+                param.data = gpu_tensor
+            t1 = time.perf_counter()
+            logger.info("ViT: moved to GPU (%.0fms)", (t1 - t0) * 1000)
 
     def _vit_to_cpu(self):
-        if self._vit_cpu_offload:
-            self.visual.to("cpu")
-            logger.info("ViT: moved back to CPU")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        if not self._vit_cpu_offload:
+            return
+        import time
+        t0 = time.perf_counter()
+        for name, param in self.visual.named_parameters():
+            param.data = self._vit_pinned[name]
+        torch.cuda.empty_cache()
+        t1 = time.perf_counter()
+        logger.info("ViT: moved to CPU (%.0fms)", (t1 - t0) * 1000)
 
     def _maybe_offload_embed_lm_head(self):
-        """Record GPU device for embed_tokens and lm_head (offloaded on demand during prefill)."""
+        """Create pinned CPU copies of embed_tokens and lm_head for fast offload during prefill."""
         if self._offload_embed_lm_head:
             if hasattr(self, "lm_head") and self.lm_head is not None:
                 self._lm_head_gpu_device = self.lm_head.weight.device
-            logger.info("embed_tokens/lm_head prefill-offload enabled (~3.9 GB freed during prefill)")
+            self._lm_head_pinned = self._make_pinned_copies(self.lm_head)
+            self._embed_pinned = self._make_pinned_copies(self.model.embed_tokens)
+            logger.info("embed_tokens/lm_head pinned CPU copies ready (~3.9 GB pinned RAM)")
 
     def _embed_lm_head_to_cpu(self):
         if not self._offload_embed_lm_head:
             return
-        self.lm_head.to("cpu")
-        self.model.embed_tokens.to("cpu")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        import time
+        t0 = time.perf_counter()
+        for name, param in self.lm_head.named_parameters():
+            param.data = self._lm_head_pinned[name]
+        for name, param in self.model.embed_tokens.named_parameters():
+            param.data = self._embed_pinned[name]
+        torch.cuda.empty_cache()
+        t1 = time.perf_counter()
+        logger.info("embed_tokens/lm_head offloaded to CPU (%.0fms)", (t1 - t0) * 1000)
 
     def _embed_lm_head_to_gpu(self):
         if not self._offload_embed_lm_head:
             return
         if self.lm_head.weight.device.type == "cpu":
-            self.lm_head.to(self._lm_head_gpu_device)
-            self.model.embed_tokens.to(self._lm_head_gpu_device)
+            import time
+            t0 = time.perf_counter()
+            for name, param in self.lm_head.named_parameters():
+                gpu_tensor = torch.empty_like(param.data, device=self._lm_head_gpu_device)
+                gpu_tensor.copy_(param.data)
+                param.data = gpu_tensor
+            t1 = time.perf_counter()
+            for name, param in self.model.embed_tokens.named_parameters():
+                gpu_tensor = torch.empty_like(param.data, device=self._lm_head_gpu_device)
+                gpu_tensor.copy_(param.data)
+                param.data = gpu_tensor
+            t2 = time.perf_counter()
             self._cuda_graph_needs_recapture = True
+            logger.info(
+                "embed_tokens/lm_head reloaded to GPU: lm_head=%.0fms, embed=%.0fms, total=%.0fms",
+                (t1 - t0) * 1000, (t2 - t1) * 1000, (t2 - t0) * 1000,
+            )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         self._vit_to_gpu()
