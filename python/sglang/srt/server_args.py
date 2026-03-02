@@ -561,6 +561,8 @@ class ServerArgs:
     record_kt_gpu_expert_distribution: bool = False
     kt_enable_dynamic_expert_update: bool = False
     kt_expert_placement_strategy: str = "uniform"
+    kt_gpu_fallback_release: bool = False
+    kt_gpu_fallback_per_layer_release: bool = False
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
@@ -4499,6 +4501,22 @@ class ServerArgs:
                  "front-loading: Fill layers from first MoE layer onwards. "
                  "uniform: Equal experts per layer. "
                  "random: Random placement with fixed seed.",
+        )
+        parser.add_argument(
+            "--kt-gpu-fallback-release",
+            action="store_true",
+            default=ServerArgs.kt_gpu_fallback_release,
+            help="[ktransformers parameter] Release GPU expert weight buffer after GPU fallback prefill completes. "
+                 "Frees ~6 GB VRAM for other operations (e.g., vision encoder). "
+                 "Buffer is re-allocated on the next GPU fallback with minimal overhead.",
+        )
+        parser.add_argument(
+            "--kt-gpu-fallback-per-layer-release",
+            action="store_true",
+            default=ServerArgs.kt_gpu_fallback_per_layer_release,
+            help="[ktransformers parameter] Release GPU expert weight buffer after each layer's MoE compute during GPU fallback, "
+                 "not just after the last layer. Frees ~6 GB between MoE operations so attention kernels have VRAM headroom. "
+                 "Implies --kt-gpu-fallback-release. Enables larger --chunked-prefill-size values.",
         )
 
         # Diffusion LLM
